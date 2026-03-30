@@ -13,6 +13,7 @@ let selectedFiles = [];
 let imageURLs = [];
 let currentImageIndex = 0;
 let backendAvailable = false;
+let ticketPollTimeout = null;
 
 const checkBackendHealth = async () => {
   try {
@@ -20,12 +21,15 @@ const checkBackendHealth = async () => {
       method: "GET",
     });
 
+    const result = await response.json();
+
     if (response.ok) {
       backendAvailable = true;
-      backendStatus.classList.remove("offline");
+      const degraded = result?.status && result.status !== "ok";
+      backendStatus.classList.toggle("offline", false);
       backendStatus.innerHTML = `
         <span class="status-dot"></span>
-        <span>Backend active - ready for submission</span>
+        <span>${degraded ? "Backend active - dependencies degraded" : "Backend active - ready for submission"}</span>
       `;
       submitButton.disabled = false;
     } else {
@@ -186,22 +190,52 @@ const formatList = (items) => {
   return `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
 };
 
-const buildSummary = (data, backendResult) => {
+const formatBoolean = (value) => (value ? "Yes" : "No");
+const formatJsonBlock = (value) =>
+  value ? `<pre class="raw-output">${escapeHtml(JSON.stringify(value, null, 2))}</pre>` : "<p>Not available</p>";
+const formatStatusHistory = (items) => {
+  if (!Array.isArray(items) || !items.length) {
+    return "<p>Not available</p>";
+  }
+
+  return `<ul>${items
+    .map((item) => {
+      const status = item?.status || "unknown";
+      const step = item?.step || "unknown";
+      const message = item?.message || "No message";
+      const at = item?.at ? new Date(item.at).toLocaleString() : "Time unavailable";
+      return `<li><strong>${escapeHtml(status)} / ${escapeHtml(step)}</strong><br>${escapeHtml(message)}<br><small>${escapeHtml(at)}</small></li>`;
+    })
+    .join("")}</ul>`;
+};
+
+const buildSummary = (data, ticket) => {
   const uploadedPhotoCount = selectedFiles.length;
-  const apiReceivedImageCount = Number.isFinite(backendResult?.receivedImageCount)
-    ? backendResult.receivedImageCount
+  const apiReceivedImageCount = Number.isFinite(ticket?.receivedImageCount)
+    ? ticket.receivedImageCount
     : 0;
-  const backendImageCount = Number.isFinite(backendResult?.imageCount)
-    ? backendResult.imageCount
+  const backendImageCount = Number.isFinite(ticket?.analysis?.imageCount)
+    ? ticket.analysis.imageCount
     : 0;
   const imagePipelineWarning =
     uploadedPhotoCount > 0 && (apiReceivedImageCount === 0 || backendImageCount === 0)
       ? "Warning: Images were selected in UI but were not fully processed by backend/model pipeline."
       : "";
-  const structured = backendResult?.structured || null;
-  const rawOutput = backendResult?.rawOutput ? escapeHtml(backendResult.rawOutput) : "No model output returned.";
+  const structured = ticket?.analysis?.structured || null;
+  const triage = ticket?.triage || {};
+  const workflow = ticket?.workflow || {};
+  const embedding = ticket?.embeddings?.summary || {};
+  const rca = ticket?.rca || {};
+  const flowDecision = rca?.result?.flowDecision || workflow?.rag?.decision || null;
+  const rawOutput = ticket?.analysis?.rawOutput ? escapeHtml(ticket.analysis.rawOutput) : "No model output returned.";
+  const latestStatus = ticket?.status || "processing";
+  const latestStep = ticket?.currentStep || "received";
+  const latestMessage = ticket?.statusMessage || "Waiting for processing update.";
 
   submissionSummary.innerHTML = `
+    <strong>Processing Status</strong>
+    <p>${escapeHtml(latestStatus)} · ${escapeHtml(latestStep)}</p>
+    <p>${escapeHtml(latestMessage)}</p>
     <strong>Request ID</strong>
     <p>${escapeHtml(data.requestId)}</p>
     <strong>Submitter Email</strong>
@@ -220,20 +254,116 @@ const buildSummary = (data, backendResult) => {
     <p>${backendImageCount} image(s) processed</p>
     ${imagePipelineWarning ? `<p class="warning-note">${escapeHtml(imagePipelineWarning)}</p>` : ""}
     <strong>Model</strong>
-    <p>${escapeHtml(backendResult?.model || "Unknown")}</p>
-    <strong>Root Cause / Structured Problem</strong>
+    <p>${escapeHtml(ticket?.analysis?.model || "Pending")}</p>
+    <strong>Short Summary</strong>
+    <p>${escapeHtml(triage?.summary || structured?.short_summary || "Pending analysis")}</p>
+    <strong>Structured Problem</strong>
     <p>${escapeHtml(structured?.structured_problem || "Not provided")}</p>
+    <strong>Error Type</strong>
+    <p>${escapeHtml(triage?.errorType || structured?.error_type || "Not provided")}</p>
+    <strong>System Context</strong>
+    <p>${escapeHtml(triage?.systemContext || structured?.system_context || "Not provided")}</p>
+    <strong>Page Context</strong>
+    <p>${escapeHtml(triage?.pageContext || structured?.page_context || "Not provided")}</p>
+    <strong>Error Code</strong>
+    <p>${escapeHtml(triage?.errorCode || structured?.error_code || "Not provided")}</p>
+    <strong>Severity</strong>
+    <p>${escapeHtml(triage?.severity || structured?.severity || "Not provided")}${structured?.severity_weight ? ` (${escapeHtml(structured.severity_weight)})` : ""}</p>
+    <strong>Impact Scope</strong>
+    <p>${escapeHtml(triage?.impactScope || structured?.impact_scope || "Not provided")}</p>
     <strong>Related Issues</strong>
-    ${formatList(structured?.related_issues)}
+    ${formatList(triage?.relatedIssues || structured?.related_issues)}
     <strong>Image Evidence</strong>
-    ${formatList(structured?.image_evidence)}
+    ${formatList(triage?.imageEvidence || structured?.image_evidence)}
     <strong>Impact Assessment</strong>
-    <p>${escapeHtml(structured?.impact_assessment || "Not provided")}</p>
+    <p>${escapeHtml(triage?.impactAssessment || structured?.impact_assessment || "Not provided")}</p>
     <strong>Preliminary Assessment</strong>
-    <p>${escapeHtml(structured?.preliminary_assessment || "Not provided")}</p>
+    <p>${escapeHtml(triage?.preliminaryAssessment || structured?.preliminary_assessment || "Not provided")}</p>
+    <strong>Occurrence Hint</strong>
+    <p>${escapeHtml(triage?.occurrenceHint || structured?.occurrence_hint || "Not provided")}</p>
+    <strong>Data Gaps</strong>
+    ${formatList(triage?.dataGaps || structured?.data_gaps)}
+    <strong>Structuring Status</strong>
+    <p>${escapeHtml(triage?.summary || structured?.short_summary ? "Completed" : "Pending")}</p>
+    <strong>Embedding Status</strong>
+    <p>${escapeHtml(embedding?.status || "Pending")}</p>
+    <strong>Embedding Model</strong>
+    <p>${escapeHtml(embedding?.model || ticket?.analysis?.embeddingModel || "Pending")}</p>
+    <strong>Extraction Coverage</strong>
+    <p>${escapeHtml(String(structured?.triage_signals?.extractedFieldCount ?? 0))} extracted signal(s)</p>
+    <strong>RAG Routing</strong>
+    <p>${escapeHtml(workflow?.rag?.status || "Not started")}</p>
+    <strong>RAG Decision</strong>
+    ${formatJsonBlock(flowDecision)}
+    <strong>Dedup Workflow</strong>
+    <p>${escapeHtml(workflow?.dedup?.status || "Not started")}</p>
+    <strong>Matched Incident</strong>
+    <p>${escapeHtml(rca?.result?.matchedRequestId || workflow?.dedup?.matchedRecordId || "None")}</p>
+    <strong>Workflow Routing</strong>
+    <p>${escapeHtml(workflow?.rca?.status || ticket?.rca?.status || "waiting_for_rag")}</p>
+    <strong>RCA Source</strong>
+    <p>${escapeHtml(rca?.result?.source || "Pending")}</p>
+    <strong>OpenCode Exit Code</strong>
+    <p>${escapeHtml(rca?.result?.exitCode ?? "Not available")}</p>
+    <strong>Status History</strong>
+    ${formatStatusHistory(ticket?.statusHistory)}
     <strong>Raw Model Output</strong>
     <pre class="raw-output">${rawOutput}</pre>
   `;
+};
+
+const clearTicketPolling = () => {
+  if (ticketPollTimeout) {
+    clearTimeout(ticketPollTimeout);
+    ticketPollTimeout = null;
+  }
+};
+
+const scheduleTicketPoll = (requestId, payload, delayMs = 2500) => {
+  clearTicketPolling();
+  ticketPollTimeout = setTimeout(() => {
+    pollTicketStatus(requestId, payload);
+  }, delayMs);
+};
+
+const pollTicketStatus = async (requestId, payload) => {
+  try {
+    const response = await fetch(`${API_BASE}/api/tickets/${encodeURIComponent(requestId)}`, {
+      method: "GET",
+    });
+
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.detail || "Failed to fetch ticket status.");
+    }
+
+    const ticket = result.ticket;
+    submissionCard.hidden = false;
+    buildSummary(payload, ticket);
+
+    if (ticket?.status === "completed") {
+      formMessage.textContent = "Analysis completed and stored successfully.";
+      formMessage.className = "form-message success";
+      clearTicketPolling();
+      return;
+    }
+
+    if (ticket?.status === "failed") {
+      const failureMessage = ticket?.error?.message || ticket?.statusMessage || "Background processing failed.";
+      formMessage.textContent = `Processing failed: ${failureMessage}`;
+      formMessage.className = "form-message error";
+      clearTicketPolling();
+      return;
+    }
+
+    formMessage.textContent = ticket?.statusMessage || "Processing is still running...";
+    formMessage.className = "form-message";
+    scheduleTicketPoll(requestId, payload);
+  } catch (error) {
+    formMessage.textContent = `Unable to refresh processing status: ${error.message}`;
+    formMessage.className = "form-message error";
+    clearTicketPolling();
+  }
 };
 
 const validateForm = (data) => {
@@ -332,11 +462,23 @@ form.addEventListener("submit", async (event) => {
 
     formMessage.textContent = result.message || "Request received. Processing started.";
     formMessage.className = "form-message success";
-    submissionCard.hidden = true;
+    submissionCard.hidden = false;
+    buildSummary(payload, {
+      status: result.status || "processing",
+      currentStep: "received",
+      statusMessage: result.message || "Request received. Processing started.",
+      receivedImageCount: selectedFiles.length,
+      analysis: {},
+      triage: {},
+      workflow: {},
+      rca: {},
+    });
+    pollTicketStatus(result.requestId || payload.requestId, payload);
   } catch (error) {
     formMessage.textContent = `Submission failed: ${error.message}`;
     formMessage.className = "form-message error";
     submissionCard.hidden = true;
+    clearTicketPolling();
   } finally {
     submitButton.disabled = false;
     submitButton.textContent = "Submit and analyze";
