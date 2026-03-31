@@ -105,6 +105,33 @@ async def get_ticket(request_id: str) -> dict[str, object]:
     return {"success": True, "ticket": jsonable_encoder(ticket)}
 
 
+@app.get("/api/tickets/recent/list")
+async def get_recent_tickets() -> dict[str, object]:
+    _require_dependency("mongo")
+
+    try:
+        tickets = await asyncio.to_thread(
+            lambda: list(
+                get_tickets_collection()
+                .find({}, {"embeddings": 0})
+                .sort("createdAt", -1)
+                .limit(5)
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch recent tickets: {exc}") from exc
+
+    for ticket in tickets:
+        if ticket.get("_id") is not None:
+            ticket["_id"] = str(ticket["_id"])
+
+    return {
+        "success": True,
+        "count": len(tickets),
+        "tickets": jsonable_encoder(tickets),
+    }
+
+
 def _default_storage_summary(route: str) -> dict[str, object]:
     return {
         "route": route,

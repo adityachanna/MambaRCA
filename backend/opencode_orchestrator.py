@@ -11,6 +11,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
@@ -39,6 +40,7 @@ OPENROUTER_MODEL_NAME = "nvidia/nemotron-3-super-120b-a12b:free"
 DEFAULT_REPO_DIR = Path(os.getenv("OPENCODE_REPO_DIR", Path(__file__).resolve().parent.parent / os.getenv("REPO_DIR_NAME", "image"))).resolve()
 DEFAULT_OPENCODE_TIMEOUT_SECONDS = int(os.getenv("OPENCODE_TIMEOUT_SECONDS", "900"))
 GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL", "https://github.com/adityachanna/ImageStudio")
+GITHUB_API_BASE_URL = "https://api.github.com"
 
 
 class FlowDecision(BaseModel):
@@ -50,11 +52,227 @@ class FlowDecision(BaseModel):
     needs_opencode: bool = Field(description="True when repository RCA via OpenCode should run.")
 
 
+class GitHubIssueDraft(BaseModel):
+    title: str = Field(description="A concise issue title in <= 90 characters.")
+    body: str = Field(description="A complete markdown issue body.")
+
+
+class GitHubCommentDraft(BaseModel):
+    comment: str = Field(description="A concise markdown comment for an existing issue.")
+
+
 def get_router_model(*, temperature: float = 0.0) -> ChatOpenRouter:
     return ChatOpenRouter(
         model=OPENROUTER_MODEL_NAME,
         temperature=temperature,
     )
+
+
+def _parse_github_repo(repo_url: str) -> tuple[str, str] | None:
+    try:
+        parsed = urlparse(repo_url)
+        path = (parsed.path or "").strip("/")
+        if not path:
+            return None
+        if path.endswith(".git"):
+            path = path[:-4]
+        parts = path.split("/")
+        if len(parts) < 2:
+            return None
+        return parts[0], parts[1]
+    except Exception:
+        return None
+
+
+def _github_headers() -> dict[str, str]:
+    token = os.getenv("GITHUB_API_KEY", "").strip()
+    if not token:
+        raise ValueError("Missing GITHUB_API_KEY for GitHub issue integration.")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
+
+
+def _extract_issue_number_from_ticket(ticket: dict[str, Any]) -> int | None:
+    github_data = (((ticket.get("rca") or {}).get("result") or {}).get("github") or {})
+    raw_issue = github_data.get("issueNumber")
+    if isinstance(raw_issue, int):
+        return raw_issue
+    if isinstance(raw_issue, str) and raw_issue.isdigit():
+        return int(raw_issue)
+    return None
+
+
+def _draft_issue_from_plan(request_id: str, plan_text: str) -> GitHubIssueDraft:
+    model = get_router_model(temperature=0)
+    structured_model = model.with_structured_output(GitHubIssueDraft)
+    prompt = (
+        "Create a production-grade GitHub issue from this RCA plan text only.\n"
+        "Use only the plan content for technical context.\n"
+        "Output fields: title and body.\n"
+        "Rules:\n"
+        "- title <= 90 chars\n"
+        "- body must include sections: Summary, Impact, Reproduction, Proposed Fix\n"
+        "- do not invent stack traces or files not present in the plan\n"
+        f"- include requestId `{request_id}` in the body\n\n"
+        f"RCA plan:\n{plan_text}"
+    )
+    draft = structured_model.invoke(prompt)
+    log_llm_response("opencode_orchestrator_github_issue_draft", request_id, draft)
+    return draft
+
+
+def _draft_comment_from_plan(request_id: str, plan_text: str) -> GitHubCommentDraft:
+    model = get_router_model(temperature=0)
+    structured_model = model.with_structured_output(GitHubCommentDraft)
+    prompt = (
+        "Write a concise GitHub issue comment using this RCA plan text only as technical context.\n"
+        "The comment should state that this new incident appears related and should be tracked with this issue.\n"
+        "Do not add technical details absent in the plan.\n"
+        "Output field: comment.\n"
+        f"Include requestId `{request_id}` in the comment.\n\n"
+        f"RCA plan:\n{plan_text}"
+    )
+    draft = structured_model.invoke(prompt)
+    log_llm_response("opencode_orchestrator_github_comment_draft", request_id, draft)
+    return draft
+
+
+def create_github_issue_from_plan(request_id: str, plan_text: str) -> dict[str, Any]:
+    repo = _parse_github_repo(GITHUB_REPO_URL)
+    if not repo:
+        return {
+            "status": "skipped",
+            "mode": "create_issue",
+            "reason": "Invalid GITHUB_REPO_URL",
+            "repository": GITHUB_REPO_URL,
+            "requestId": request_id,
+        }
+
+    if not plan_text or not plan_text.strip():
+        return {
+            "status": "skipped",
+            "mode": "create_issue",
+            "reason": "Missing RCA plan text",
+            "repository": GITHUB_REPO_URL,
+            "requestId": request_id,
+        }
+
+    owner, repo_name = repo
+    try:
+        draft = _draft_issue_from_plan(request_id, plan_text)
+        payload = {
+            "title": draft.title.strip()[:90] or f"RCA follow-up for {request_id}",
+            "body": draft.body.strip(),
+            "labels": ["mamba-rca", f"requestId:{request_id}"],
+        }
+        response = requests.post(
+            f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo_name}/issues",
+            headers=_github_headers(),
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "status": "created",
+            "mode": "create_issue",
+            "requestId": request_id,
+            "repository": f"{owner}/{repo_name}",
+            "issueNumber": data.get("number"),
+            "issueUrl": data.get("html_url"),
+            "issueApiUrl": data.get("url"),
+            "issueTitle": data.get("title"),
+            "generatedFrom": "plan",
+        }
+    except Exception as exc:
+        logger.error("GitHub issue creation failed for requestId=%s: %s", request_id, exc)
+        return {
+            "status": "failed",
+            "mode": "create_issue",
+            "requestId": request_id,
+            "repository": f"{owner}/{repo_name}",
+            "error": str(exc),
+            "generatedFrom": "plan",
+        }
+
+
+def add_comment_to_existing_issue_from_plan(request_id: str, matched_ticket: dict[str, Any]) -> dict[str, Any]:
+    repo = _parse_github_repo(GITHUB_REPO_URL)
+    if not repo:
+        return {
+            "status": "skipped",
+            "mode": "comment_existing_issue",
+            "reason": "Invalid GITHUB_REPO_URL",
+            "repository": GITHUB_REPO_URL,
+            "requestId": request_id,
+        }
+
+    issue_number = _extract_issue_number_from_ticket(matched_ticket)
+    if not issue_number:
+        return {
+            "status": "skipped",
+            "mode": "comment_existing_issue",
+            "reason": "Matched ticket has no GitHub issue number",
+            "repository": GITHUB_REPO_URL,
+            "requestId": request_id,
+            "matchedRequestId": matched_ticket.get("requestId"),
+        }
+
+    plan_text = str((((matched_ticket.get("rca") or {}).get("result") or {}).get("report") or "")).strip()
+    if not plan_text:
+        return {
+            "status": "skipped",
+            "mode": "comment_existing_issue",
+            "reason": "Matched ticket has no RCA plan text",
+            "repository": GITHUB_REPO_URL,
+            "requestId": request_id,
+            "matchedRequestId": matched_ticket.get("requestId"),
+            "issueNumber": issue_number,
+        }
+
+    owner, repo_name = repo
+    try:
+        draft = _draft_comment_from_plan(request_id, plan_text)
+        response = requests.post(
+            f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo_name}/issues/{issue_number}/comments",
+            headers=_github_headers(),
+            json={"body": draft.comment.strip()},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "status": "commented",
+            "mode": "comment_existing_issue",
+            "requestId": request_id,
+            "matchedRequestId": matched_ticket.get("requestId"),
+            "repository": f"{owner}/{repo_name}",
+            "issueNumber": issue_number,
+            "commentUrl": data.get("html_url"),
+            "commentApiUrl": data.get("url"),
+            "generatedFrom": "plan",
+        }
+    except Exception as exc:
+        logger.error(
+            "GitHub issue comment failed for requestId=%s matchedRequestId=%s: %s",
+            request_id,
+            matched_ticket.get("requestId"),
+            exc,
+        )
+        return {
+            "status": "failed",
+            "mode": "comment_existing_issue",
+            "requestId": request_id,
+            "matchedRequestId": matched_ticket.get("requestId"),
+            "repository": f"{owner}/{repo_name}",
+            "issueNumber": issue_number,
+            "error": str(exc),
+            "generatedFrom": "plan",
+        }
 
 
 def _utc_now() -> datetime:
@@ -726,8 +944,15 @@ def update_ticket_with_match(
     flow_decision: FlowDecision,
     retrieved_incidents: list[dict[str, Any]],
     agent_messages: list[dict[str, Any] | str],
+    github_record: dict[str, Any] | None = None,
 ) -> None:
     now = _utc_now()
+    github_result = github_record or {
+        "status": "skipped",
+        "mode": "comment_existing_issue",
+        "reason": "GitHub comment step was not executed.",
+        "requestId": request_id,
+    }
     update_ticket_fields(
         request_id,
         {
@@ -753,6 +978,7 @@ def update_ticket_with_match(
                     "completedAt": now,
                     "summary": "Vector search found a similar ticket; external RCA skipped.",
                 },
+                "github": github_result,
             },
             "rca": {
                 "status": "skipped_duplicate",
@@ -765,6 +991,7 @@ def update_ticket_with_match(
                     "matchedMetadata": ((matched_ticket.get("embeddings") or {}).get("summary") or {}).get("metadata"),
                     "flowDecision": flow_decision.model_dump(),
                     "agentMessages": agent_messages,
+                    "github": github_result,
                     "generatedAt": now,
                 },
             },
@@ -787,10 +1014,17 @@ def update_ticket_with_opencode_report(
     retrieved_incidents: list[dict[str, Any]],
     agent_messages: list[dict[str, Any] | str],
     execution: dict[str, Any],
+    github_record: dict[str, Any] | None = None,
 ) -> None:
     now = _utc_now()
     success = execution["exitCode"] == 0 and not execution["timedOut"]
     report_text = execution["stdout"].strip() or execution["stderr"].strip()
+    github_result = github_record or {
+        "status": "skipped",
+        "mode": "create_issue",
+        "reason": "GitHub issue creation step was not executed.",
+        "requestId": request_id,
+    }
     update_ticket_fields(
         request_id,
         {
@@ -824,6 +1058,7 @@ def update_ticket_with_opencode_report(
                         )
                     ),
                 },
+                "github": github_result,
             },
             "rca": {
                 "status": "completed" if success else ("timed_out" if execution["timedOut"] else "failed"),
@@ -850,6 +1085,7 @@ def update_ticket_with_opencode_report(
                     "terminated": execution["terminated"],
                     "timeoutSeconds": execution["timeoutSeconds"],
                     "stderr": execution["stderr"],
+                    "github": github_result,
                     "generatedAt": now,
                 },
             },
@@ -982,7 +1218,15 @@ def execute_rag_flow(
             request_id,
             matched_ticket.get("requestId"),
         )
-        update_ticket_with_match(request_id, matched_ticket, flow_decision, retrieved_incidents, agent_messages)
+        github_comment_result = add_comment_to_existing_issue_from_plan(request_id, matched_ticket)
+        update_ticket_with_match(
+            request_id,
+            matched_ticket,
+            flow_decision,
+            retrieved_incidents,
+            agent_messages,
+            github_comment_result,
+        )
         return {
             "status": "matched",
             "requestId": request_id,
@@ -990,6 +1234,7 @@ def execute_rag_flow(
             "matched": matched_ticket,
             "retrievedIncidents": retrieved_incidents,
             "agentMessages": agent_messages,
+            "github": github_comment_result,
         }
 
     append_ticket_status_event(request_id, "processing", "opencode_rca", "RAG agent selected OpenCode API RCA.")
@@ -1044,6 +1289,10 @@ def execute_rag_flow(
     prompt = build_opencode_prompt(ticket, structured, repo_dir, analysis_brief, local_artifact_paths)
 
     execution = run_opencode_api_rca(repo_dir, prompt, timeout_seconds=opencode_timeout_seconds)
+    github_issue_result = create_github_issue_from_plan(
+        request_id,
+        execution.get("stdout", "") or execution.get("stderr", ""),
+    )
 
     cleanup_repo(repo_dir)
 
@@ -1063,6 +1312,7 @@ def execute_rag_flow(
         retrieved_incidents,
         agent_messages,
         execution,
+        github_issue_result,
     )
     success = execution["exitCode"] == 0 and not execution["timedOut"]
     return {
@@ -1078,6 +1328,7 @@ def execute_rag_flow(
         "terminated": execution["terminated"],
         "timeoutSeconds": execution["timeoutSeconds"],
         "opencodeSessionId": execution.get("sessionId"),
+        "github": github_issue_result,
         "context": {
             "sessionId": execution.get("sessionId"),
             "json": execution.get("exportJson"),
